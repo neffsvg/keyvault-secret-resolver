@@ -1,93 +1,83 @@
 package main
 
 import (
+	"context"
 	"errors"
-	"flag"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
 	"github.com/joho/godotenv"
 	"log"
-	"maps"
-	"os/exec"
-	"strconv"
-	"strings"
 	"sync"
 )
-
-const (
-	Prefix = "SECRET:"
-)
+import flag "github.com/spf13/pflag"
 
 func main() {
-	//configPath := flag.String("configPath", ".setupenvconfig", "config file")
-	envPath := flag.String("env", ".env", ".env file where to replace secrets with azure keyvault secrets")
-	vault := flag.String("vault", "", "keyvault name to get env variables from")
+	secretsSpecFile := flag.StringP("secrets-env-file", "s", "", "secrets.env file where secrets are specified with their keyvault names")
+	resultPath := flag.StringP("result-env-file-path", "r", ".env", ".env file to put in config and resolved secrets")
+	vault := flag.StringP("keyvault", "k", "", "keyvault name to get env variables from")
 	flag.Parse()
 
+	// check if all flags are set
 	if vault == nil || len(*vault) == 0 {
 		log.Fatal("Missing vault flag, use -h for help.")
-	} else if envPath == nil || len(*vault) == 0 {
-		log.Fatal("Missing env flag, use -h for help.")
+	} else if secretsSpecFile == nil || len(*secretsSpecFile) == 0 {
+		log.Fatal("Missing secrets-env flag, use -h for help.")
+	} else if resultPath == nil || len(*resultPath) == 0 {
+		log.Fatal("Missing result-path flag, use -h for help.")
 	}
 
-	configMap := loadEnvFile(*envPath)
-	secrets := getSecretsFrom(configMap)
-	resolvedSecrets := loadSecrets(*vault, secrets)
+	var secretsMap map[string]string
+	secretsMap, readError := godotenv.Read(*secretsSpecFile)
+	if readError != nil {
+		log.Fatal("Unable to read variables from .env file:", *secretsSpecFile, "\n", readError)
+	}
 
-	// write resolved secrets back into configmap (unique, because map / key)
-	maps.Copy(configMap, resolvedSecrets)
-	err := godotenv.Write(configMap, *envPath)
-	if err != nil {
-		log.Fatal("Failed to write into .env file", err)
+	client, clientError := createAzureClient(*vault)
+	if clientError != nil {
+		log.Fatal(clientError)
+	}
+	resolvedSecrets := loadSecrets(client, secretsMap)
+
+	writeError := godotenv.Write(resolvedSecrets, *resultPath)
+	if writeError != nil {
+		log.Fatal("Failed to write into .env file. " + writeError.Error())
 	} else {
-		log.Println("Done. Resolved " + strconv.Itoa(len(resolvedSecrets)) + " secrets.")
+		log.Printf("Done. Resolved %v of %v secrets.\n", len(resolvedSecrets), len(secretsMap))
 	}
 }
 
-func loadEnvFile(envPath string) map[string]string {
-	err := godotenv.Load(envPath)
-	if err != nil {
-		log.Fatal("Unable to load .env file, please check file path: ", envPath, err)
-	}
-	var config map[string]string
-	config, err = godotenv.Read()
-	if err != nil {
-		log.Fatal("Unable to read variables from .env file: ", envPath)
-	}
-	return config
-}
-
-func getSecretsFrom(configMap map[string]string) map[string]string {
-	var secrets = make(map[string]string)
-	for key, value := range configMap {
-		if strings.HasPrefix(value, Prefix) {
-			secrets[key] = strings.Trim(value, Prefix)
-		}
-	}
-	return secrets
-}
-
-func loadSecrets(vault string, secrets map[string]string) map[string]string {
+func loadSecrets(client *azsecrets.Client, secrets map[string]string) map[string]string {
 	wg := sync.WaitGroup{}
 	var resolvedSecrets = make(map[string]string)
 	for secretKey, secretName := range secrets {
 		wg.Add(1)
-
 		go func() {
 			defer wg.Done()
-			//log.Println("az", "keyvault", "secret", "show", "--vault-name", vault, "--name", secretName, "--query", "value")
-			out, err := exec.Command("az", "keyvault", "secret", "show", "--vault-name", vault, "--name", secretName, "--query", "value").Output()
-			//out, err := exec.Command("az", "keyvault", "secret", "show", "--vault", "devops-svg-csi-keyvault", "--name", "m-mysvg-dmaut-db-user-name", "--query", "value").Output()
+			// empty version, will omit version parameter in api call and defaults to latest version
+			secretResponse, err := client.GetSecret(context.TODO(), secretName, "", nil)
 			if err != nil {
-				var ee *exec.ExitError
-				errors.As(err, &ee)
-				log.Println("Could not load secret " + secretName + " -> " + string(ee.Stderr))
-				log.Println("Have you called az login first? You might have insufficient permissions on the given keyvault '" + vault + "'\n")
+				log.Println("Could not resolve secret:", secretName, "\n", err)
 			} else {
-				secretValue := strings.Trim(strings.TrimSpace(string(out)), "\"")
-				log.Println("Got secret " + secretName + " " + secretValue)
+				secretValue := *secretResponse.Value
+				log.Println("Resolved secret:", secretName)
 				resolvedSecrets[secretKey] = secretValue
 			}
 		}()
 	}
 	wg.Wait()
 	return resolvedSecrets
+}
+
+func createAzureClient(vaultName string) (*azsecrets.Client, error) {
+	credentials, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return nil, errors.New("Unable to authenticate with azure, run `az login` in terminal. " + err.Error())
+	}
+	vaultURL := "https://" + vaultName + ".vault.azure.net/"
+	client, err := azsecrets.NewClient(vaultURL, credentials, nil)
+	if err != nil {
+		return nil, errors.New("Unable to create azure client / connect to key vault. " + err.Error())
+	} else {
+		return client, nil
+	}
 }

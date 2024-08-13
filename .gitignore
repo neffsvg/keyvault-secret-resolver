@@ -1,1 +1,5 @@
 .idea
+tmp
+
+.env
+.env.secrets
